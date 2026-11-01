@@ -33,23 +33,60 @@ double DetectHaze(const cv::Mat& image)
     cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
     cv::cvtColor(image, hsv, cv::COLOR_BGR2HSV);
 
-    cv::Scalar meanGray, stdGray;
-    cv::meanStdDev(gray, meanGray, stdGray);
+    const int rows = gray.rows;
+    const int cols = gray.cols;
 
-    cv::Scalar meanHSV = cv::mean(hsv);
+    const int regions = 4;
+    double contrastSum = 0.0;
+    double edgeSum = 0.0;
+    double brightnessSum = 0.0;
 
-    double contrast = stdGray[0];
-    double saturation = meanHSV[1];
+    for (int i = 0; i < regions; ++i)
+    {
+        int y1 = i * rows / regions;
+        int y2 = (i + 1) * rows / regions;
 
-    double confidence = 0.0;
+        cv::Mat region = gray(
+            cv::Range(y1, y2),
+            cv::Range(0, cols));
 
-    if (contrast < 35.0)
-        confidence += 0.5;
+        cv::Scalar mean, stddev;
+        cv::meanStdDev(region, mean, stddev);
 
-    if (saturation < 65.0)
-        confidence += 0.5;
+        contrastSum += stddev[0];
 
-    return std::min(confidence, 1.0);
+        cv::Mat edges;
+        cv::Canny(region, edges, 50, 150);
+
+        double edgeDensity =
+            static_cast<double>(cv::countNonZero(edges)) /
+            edges.total();
+
+        edgeSum += edgeDensity;
+
+        brightnessSum += mean[0];
+    }
+
+    double averageContrast = contrastSum / regions;
+    double averageEdgeDensity = edgeSum / regions;
+    double averageBrightness = brightnessSum / regions;
+
+    // Preliminary fog indicators
+    double contrastScore =
+        std::clamp((45.0 - averageContrast) / 45.0, 0.0, 1.0);
+
+    double edgeScore =
+        std::clamp((0.06 - averageEdgeDensity) / 0.06, 0.0, 1.0);
+
+    double brightnessScore =
+        std::clamp((averageBrightness - 100.0) / 100.0, 0.0, 1.0);
+
+    double confidence =
+        0.45 * contrastScore +
+        0.35 * edgeScore +
+        0.20 * brightnessScore;
+
+    return confidence;
 }
 
 // --------------------------------------------------
