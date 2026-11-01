@@ -1,5 +1,6 @@
 #include <opencv2/opencv.hpp>
 #include <iostream>
+#include <filesystem>
 #include <string>
 #include <vector>
 #include <cmath>
@@ -195,6 +196,189 @@ CameraHealthStatus AnalyzeImage(const cv::Mat& image)
 }
 
 // --------------------------------------------------
+// Dark Channel Prior
+// --------------------------------------------------
+cv::Mat DarkChannel(const cv::Mat& image, int patchSize = 15)
+{
+    std::vector<cv::Mat> channels;
+    cv::split(image, channels);
+
+    cv::Mat minimum;
+    cv::min(channels[0], channels[1], minimum);
+    cv::min(minimum, channels[2], minimum);
+
+    cv::Mat kernel = cv::getStructuringElement(
+        cv::MORPH_RECT,
+        cv::Size(patchSize, patchSize));
+
+    cv::Mat dark;
+    cv::erode(minimum, dark, kernel);
+
+    return dark;
+}
+
+// --------------------------------------------------
+// Estimate atmospheric light
+// --------------------------------------------------
+cv::Vec3f EstimateAtmosphericLight(
+    const cv::Mat& image,
+    const cv::Mat& dark)
+{
+    struct Candidate
+    {
+        float Dark;
+        int Index;
+    };
+
+    std::vector<Candidate> candidates;
+
+    for (int y = 0; y < dark.rows; ++y)
+    {
+        const float* row = dark.ptr<float>(y);
+
+        for (int x = 0; x < dark.cols; ++x)
+        {
+            candidates.push_back({
+                row[x],
+                y * dark.cols + x
+            });
+        }
+    }
+
+    int count = std::max(
+        1,
+        static_cast<int>(candidates.size() * 0.001));
+
+    std::partial_sort(
+        candidates.begin(),
+        candidates.begin() + count,
+        candidates.end(),
+        [](const Candidate& a, const Candidate& b)
+        {
+            return a.Dark > b.Dark;
+        });
+
+    cv::Vec3f atmosphericLight(0, 0, 0);
+    float brightest = -1.0f;
+
+    for (int i = 0; i < count; ++i)
+    {
+        int index = candidates[i].Index;
+
+        int y = index / image.cols;
+        int x = index % image.cols;
+
+        cv::Vec3f pixel = image.at<cv::Vec3f>(y, x);
+
+        float brightness = pixel[0] + pixel[1] + pixel[2];
+
+        if (brightness > brightest)
+        {
+            brightest = brightness;
+            atmosphericLight = pixel;
+        }
+    }
+
+    return atmosphericLight;
+}
+
+// --------------------------------------------------
+// Estimate transmission
+// --------------------------------------------------
+cv::Mat EstimateTransmission(
+    const cv::Mat& image,
+    const cv::Vec3f& atmosphericLight,
+    float omega = 0.95f)
+{
+    cv::Mat normalized = image.clone();
+
+    for (int y = 0; y < image.rows; ++y)
+    {
+        for (int x = 0; x < image.cols; ++x)
+        {
+            cv::Vec3f& pixel = normalized.at<cv::Vec3f>(y, x);
+
+            for (int c = 0; c < 3; ++c)
+            {
+                pixel[c] /= std::max(
+                    atmosphericLight[c], 0.1f);
+            }
+        }
+    }
+
+    cv::Mat dark = DarkChannel(normalized);
+
+    cv::Mat transmission =
+        1.0f - omega * dark;
+
+    // Smooth transmission to reduce patch artifacts.
+    cv::Mat refined;
+
+    cv::bilateralFilter(
+        transmission,
+        refined,
+        9,
+        0.1,
+        7.0);
+
+    return refined;
+}
+
+// --------------------------------------------------
+// Remove fog
+// --------------------------------------------------
+cv::Mat Dehaze(const cv::Mat& input)
+{
+    cv::Mat image;
+
+    input.convertTo(image, CV_32FC3, 1.0 / 255.0);
+
+    cv::Mat dark = DarkChannel(image);
+
+    cv::Vec3f atmosphericLight =
+        EstimateAtmosphericLight(image, dark);
+
+    cv::Mat transmission =
+        EstimateTransmission(image, atmosphericLight);
+
+    cv::Mat result(image.size(), CV_32FC3);
+
+    const float minimumTransmission = 0.10f;
+
+    for (int y = 0; y < image.rows; ++y)
+    {
+        for (int x = 0; x < image.cols; ++x)
+        {
+            cv::Vec3f original =
+                image.at<cv::Vec3f>(y, x);
+
+            float t = std::max(
+                transmission.at<float>(y, x),
+                minimumTransmission);
+
+            cv::Vec3f restored;
+
+            for (int c = 0; c < 3; ++c)
+            {
+                restored[c] =
+                    (original[c] - atmosphericLight[c]) / t
+                    + atmosphericLight[c];
+
+                restored[c] = std::clamp(
+                    restored[c], 0.0f, 1.0f);
+            }
+
+            result.at<cv::Vec3f>(y, x) = restored;
+        }
+    }
+
+    cv::Mat output;
+    result.convertTo(output, CV_8UC3, 255.0);
+
+    return output;
+}
+
+// --------------------------------------------------
 // Main
 // --------------------------------------------------
 int main(int argc, char* argv[])
@@ -216,31 +400,79 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    // Analyze original image.
     CameraHealthStatus status = AnalyzeImage(image);
 
-    std::cout << "\n========== Camera Image Analysis ==========\n";
+    std::cout << "\n========== CAMERA HEALTH ==========\n";
 
     std::cout << "Image: " << filename << "\n";
 
     std::cout << "Rain: "
               << (status.RainDetected ? "DETECTED" : "NOT DETECTED")
-              << " (confidence: " << status.RainConfidence << ")\n";
+              << "\n";
 
     std::cout << "Water droplets: "
               << (status.DropletsDetected ? "DETECTED" : "NOT DETECTED")
-              << " (confidence: " << status.DropletConfidence << ")\n";
+              << "\n";
 
-    std::cout << "Haze: "
+    std::cout << "Fog: "
               << (status.HazeDetected ? "DETECTED" : "NOT DETECTED")
-              << " (confidence: " << status.HazeConfidence << ")\n";
-
-    std::cout << "-------------------------------------------\n";
+              << "\n";
 
     std::cout << "Camera status: "
               << (status.IsClean() ? "CLEAN" : "DEGRADED")
               << "\n";
 
-    std::cout << "===========================================\n";
+    // Only create a comparison image if degraded.
+    if (!status.IsClean())
+    {
+        std::cout << "\nDehazing image...\n";
+
+        cv::Mat cleared = Dehaze(image);
+
+        // Place original on left and enhanced on right.
+        cv::Mat comparison;
+
+        cv::hconcat(image, cleared, comparison);
+
+        // Add labels.
+        cv::putText(
+            comparison,
+            "ORIGINAL",
+            cv::Point(20, 40),
+            cv::FONT_HERSHEY_SIMPLEX,
+            1.0,
+            cv::Scalar(0, 255, 255),
+            2);
+
+        cv::putText(
+            comparison,
+            "DEHAZED",
+            cv::Point(image.cols + 20, 40),
+            cv::FONT_HERSHEY_SIMPLEX,
+            1.0,
+            cv::Scalar(0, 255, 0),
+            2);
+
+        std::filesystem::path inputPath(filename);
+
+        std::string outputFilename =
+            inputPath.stem().string() + "_comparison.jpg";
+
+        if (!cv::imwrite(outputFilename, comparison))
+        {
+            std::cerr << "Error: Cannot save comparison image\n";
+            return 1;
+        }
+
+        std::cout << "Output: " << outputFilename << "\n";
+    }
+    else
+    {
+        std::cout << "\nImage is clean. No processing required.\n";
+    }
+
+    std::cout << "===================================\n";
 
     return 0;
 }
